@@ -66,7 +66,9 @@ class BinaryTreeSet extends Actor {
 
   // optional
   /** Accepts `Operation` and `GC` messages. */
-  val normal: Receive = { case _ => ??? }
+  val normal: Receive = {
+    case msg: Operation => root ! msg
+  }
 
   // optional
   /** Handles messages while garbage collection is performed.
@@ -101,7 +103,31 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
 
   // optional
   /** Handles `Operation` messages and `CopyTo` requests. */
-  val normal: Receive = { case _ => ??? }
+  val normal: Receive = {
+    case msg @ Contains(req, id, value) =>
+      if (elem == value) {
+        req ! ContainsResult(id, true)
+      } else {
+        val position = if (value < elem) Left else Right
+        subtrees.get(position) match {
+          case Some(tree) => tree ! msg
+          case None => req ! ContainsResult(id, false)
+        }
+      }
+
+    case msg @ Insert(req, id, value) =>
+      if (elem == value) {
+        req ! OperationFinished(id)
+      } else {
+        val position = if (value < elem) Left else Right
+        subtrees.get(position) match {
+          case Some(tree) => tree ! msg
+          case None =>
+            subtrees = subtrees.updated(position, context.actorOf(props(value, false)))
+            req ! OperationFinished(id)
+        }
+      }
+  }
 
   // optional
   /** `expected` is the set of ActorRefs whose replies we are waiting for,
