@@ -106,7 +106,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
   val normal: Receive = {
     case msg @ Contains(req, id, value) =>
       if (elem == value) {
-        req ! ContainsResult(id, true)
+        req ! ContainsResult(id, !removed)
       } else {
         val position = if (value < elem) Left else Right
         subtrees.get(position) match {
@@ -117,6 +117,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
 
     case msg @ Insert(req, id, value) =>
       if (elem == value) {
+        removed = false
         req ! OperationFinished(id)
       } else {
         val position = if (value < elem) Left else Right
@@ -125,6 +126,18 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
           case None =>
             subtrees = subtrees.updated(position, context.actorOf(props(value, false)))
             req ! OperationFinished(id)
+        }
+      }
+
+    case msg @ Remove(req, id, value) =>
+      if (elem == value) {
+        removed = true
+        req ! OperationFinished(id)
+      } else {
+        val position = if (value < elem) Left else Right
+        subtrees.get(position) match {
+          case Some(tree) => tree ! msg
+          case None => req ! OperationFinished(id)
         }
       }
   }
