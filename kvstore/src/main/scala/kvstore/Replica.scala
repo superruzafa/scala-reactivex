@@ -46,6 +46,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
+  var expectedSeq = 0L
 
   def receive = {
     case JoinedPrimary   => context.become(leader)
@@ -65,8 +66,18 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   }
 
   /* TODO Behavior for the replica role. */
-  val replica: Receive = {
-    case _ =>
+  val replica: Receive = leader orElse {
+    case Snapshot(key, valueOption, seq) =>
+      if (seq == expectedSeq) {
+        valueOption match {
+          case Some(value) => kv = kv + ((key, value))
+          case None => kv = kv - key
+        }
+      }
+      if (seq <= expectedSeq) {
+        sender ! SnapshotAck(key, seq)
+        expectedSeq = math.max(expectedSeq, seq + 1L)
+      }
   }
 
   arbiter ! Arbiter.Join
