@@ -12,6 +12,8 @@ object Replicator {
   case class Snapshot(key: String, valueOption: Option[String], seq: Long)
   case class SnapshotAck(key: String, seq: Long)
 
+  case class Retry(seq: Long)
+
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
 
@@ -39,7 +41,26 @@ class Replicator(val replica: ActorRef) extends Actor {
   
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
-    case _ =>
+    case msg @ Replicate(key, valueOption, id) =>
+      val seq = nextSeq
+      acks = acks + ((seq, (sender, msg)))
+      self ! Retry(seq)
+
+    case msg @ Retry(seq) =>
+      acks.get(seq) match {
+        case Some((_, Replicate(key, valueOption, id))) =>
+          context.system.scheduler.scheduleOnce(100.milliseconds, self, msg)
+          replica ! Snapshot(key, valueOption, seq)
+        case None =>
+      }
+
+    case SnapshotAck(key, seq) =>
+      acks.get(seq) match {
+        case Some((actor, Replicate(key, _, id))) =>
+          acks = acks - seq
+          actor ! Replicated(key, id)
+        case None =>
+      }
   }
 
 }
