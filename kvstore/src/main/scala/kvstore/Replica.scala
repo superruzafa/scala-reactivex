@@ -36,6 +36,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   import Persistence._
   import context.dispatcher
 
+  private case class TryPersist(key: String, valueOption: Option[String], id: Long) {
+    val persistMsg = Persist(key, valueOption, id)
+  }
+
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
@@ -46,38 +50,55 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
+  var persistence = context.actorOf(persistenceProps)
   var expectedSeq = 0L
+  var senderById = Map.empty[Long, ActorRef]
 
   def receive = {
     case JoinedPrimary   => context.become(leader)
     case JoinedSecondary => context.become(replica)
   }
 
+  // Common behavior for both leaders and secondary replicas
+  val common: Receive = {
+    case Get(key, id) =>
+      sender ! GetResult(key, kv.get(key), id)
+  }
+
   /* TODO Behavior for  the leader role. */
-  val leader: Receive = {
+  val leader: Receive = common.orElse {
     case Insert(key, value, id) =>
       kv = kv + ((key, value))
       sender ! OperationAck(id)
     case Remove(key, id) =>
       kv = kv - key
       sender ! OperationAck(id)
-    case Get(key, id) =>
-      sender ! GetResult(key, kv.get(key), id)
   }
 
   /* TODO Behavior for the replica role. */
-  val replica: Receive = leader orElse {
+  val replica: Receive = common.orElse {
     case Snapshot(key, valueOption, seq) =>
-      if (seq == expectedSeq) {
+      if (seq < expectedSeq) {
+        sender ! SnapshotAck(key, seq)
+      } else if (seq == expectedSeq) {
         valueOption match {
           case Some(value) => kv = kv + ((key, value))
           case None => kv = kv - key
         }
+        senderById = senderById + ((seq, sender))
+        self ! TryPersist(key, valueOption, seq)
       }
-      if (seq <= expectedSeq) {
-        sender ! SnapshotAck(key, seq)
-        expectedSeq = math.max(expectedSeq, seq + 1L)
+
+    case msg @ TryPersist(_, _, seq) =>
+      if (seq == expectedSeq) {
+        context.system.scheduler.scheduleOnce(100.milliseconds, self, msg)
+        persistence ! msg.persistMsg
       }
+
+    case Persisted(key, seq) =>
+      senderById.get(seq).foreach { _ ! SnapshotAck(key, seq) }
+      senderById = senderById - seq
+      expectedSeq = math.max(expectedSeq, seq + 1L)
   }
 
   arbiter ! Arbiter.Join
