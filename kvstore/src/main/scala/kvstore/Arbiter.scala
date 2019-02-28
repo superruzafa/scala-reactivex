@@ -24,13 +24,12 @@ class Arbiter extends Actor {
     case Join =>
       if (leader.isEmpty) {
         leader = Some(sender)
-        replicas += sender
         sender ! JoinedPrimary
       } else {
-        replicas += sender
         sender ! JoinedSecondary
       }
-      leader foreach (_ ! Replicas(replicas))
+      replicas = replicas + sender
+      leader foreach { _ ! Replicas(replicas) }
   }
 
 }
