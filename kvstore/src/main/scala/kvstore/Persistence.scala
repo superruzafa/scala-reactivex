@@ -2,7 +2,6 @@ package kvstore
 
 import akka.actor.{Props, Actor}
 import scala.util.Random
-import java.util.concurrent.atomic.AtomicInteger
 
 object Persistence {
   case class Persist(key: String, valueOption: Option[String], id: Long)

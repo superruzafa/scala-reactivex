@@ -1,8 +1,6 @@
 package kvstore
 
-import akka.actor.Props
-import akka.actor.Actor
-import akka.actor.ActorRef
+import akka.actor.{Actor, ActorRef, Cancellable, Props}
 import scala.concurrent.duration._
 
 object Replicator {
@@ -12,7 +10,15 @@ object Replicator {
   case class Snapshot(key: String, valueOption: Option[String], seq: Long)
   case class SnapshotAck(key: String, seq: Long)
 
-  case class Retry(seq: Long)
+  case class ReplicateStatus(
+    id: Long,
+    key: String,
+    valueOption: Option[String],
+    primary: ActorRef,
+    timeout: Cancellable
+  )
+
+  case class SnapshotTimeout(seq: Long)
 
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
@@ -27,9 +33,7 @@ class Replicator(val replica: ActorRef) extends Actor {
    */
 
   // map from sequence number to pair of sender and request
-  var acks = Map.empty[Long, (ActorRef, Replicate)]
-  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
-  var pending = Vector.empty[Snapshot]
+  var replicates = Map.empty[Long, ReplicateStatus]
   
   var _seqCounter = 0L
   def nextSeq() = {
@@ -43,22 +47,30 @@ class Replicator(val replica: ActorRef) extends Actor {
   def receive: Receive = {
     case msg @ Replicate(key, valueOption, id) =>
       val seq = nextSeq
-      acks = acks + ((seq, (sender, msg)))
-      self ! Retry(seq)
+      val rs = ReplicateStatus(
+        id = id,
+        key = key,
+        valueOption = valueOption,
+        primary = sender,
+        timeout =
+          context.system.scheduler.schedule(
+            100.milliseconds, 100.milliseconds, self, SnapshotTimeout(seq))
+      )
+      replicates += ((seq, rs))
+      replica ! Snapshot(key, valueOption, seq)
 
-    case msg @ Retry(seq) =>
-      acks.get(seq) match {
-        case Some((_, Replicate(key, valueOption, id))) =>
-          context.system.scheduler.scheduleOnce(100.milliseconds, self, msg)
-          replica ! Snapshot(key, valueOption, seq)
+    case SnapshotTimeout(seq) =>
+      replicates.get(seq) match {
+        case Some(rs) => replica ! Snapshot(rs.key, rs.valueOption, seq)
         case None =>
       }
 
     case SnapshotAck(key, seq) =>
-      acks.get(seq) match {
-        case Some((actor, Replicate(key, _, id))) =>
-          acks = acks - seq
-          actor ! Replicated(key, id)
+      replicates.get(seq) match {
+        case Some(rs) =>
+          replicates -= seq
+          rs.timeout.cancel
+          rs.primary ! Replicated(key, rs.id)
         case None =>
       }
   }
