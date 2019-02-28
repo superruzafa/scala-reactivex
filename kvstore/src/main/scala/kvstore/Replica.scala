@@ -30,31 +30,36 @@ object Replica {
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 
   case class OperationStatus(
+    id: Long,
     key: String,
     valueOption: Option[String],
-    senderActor: ActorRef,
+    client: ActorRef,
     remainingReplicators: Set[ActorRef],
     persisted: Boolean,
     operationTimeout: Cancellable,
     persistTimeout: Cancellable
-  ) {
-    def done(): Unit = {
-      operationTimeout.cancel
-      persistTimeout.cancel
-      ()
-    }
+  )
+
+  def isOperationDone(op: OperationStatus): Boolean =
+    op.persisted && op.remainingReplicators.isEmpty
+
+  def finishOperation(op: OperationStatus, ack: Boolean): Unit = {
+    op.operationTimeout.cancel
+    val message = if (ack) OperationAck(op.id) else OperationFailed(op.id)
+    op.client ! message
   }
 
   case class SnapshotStatus(
+    seq: Long,
     key: String,
     valueOption: Option[String],
-    senderActor: ActorRef,
+    replicator: ActorRef,
     persistTimeout: Cancellable
-  ) {
-    def done(): Unit = {
-      persistTimeout.cancel
-      ()
-    }
+  )
+
+  def finishSnapshot(s: SnapshotStatus): Unit = {
+    s.persistTimeout.cancel
+    s.replicator ! Replicator.SnapshotAck(s.key, s.seq)
   }
 
   case class PersistTimeout(id: Long)
@@ -73,7 +78,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
-  var replicatorBySecondary = Map.empty[ActorRef, ActorRef]
+  var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
@@ -87,31 +92,27 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case JoinedSecondary => context.become(replica)
   }
 
-  def isOperationDone(status: OperationStatus): Boolean = {
-    status.remainingReplicators.isEmpty && status.persisted
-  }
-
   // Common behavior for both leaders and secondary replicas
   val common: Receive = {
-    case Get(key, id) =>
-      sender ! GetResult(key, kv.get(key), id)
+    case Get(key, id) => sender ! GetResult(key, kv.get(key), id)
   }
 
   def runUpdate(key: String, valueOption: Option[String], id: Long): Unit = {
-      val persistTimeout = context.system.scheduler.schedule(
-        100.milliseconds, 100.milliseconds, self, PersistTimeout(id))
-      val operationTimeout = context.system.scheduler.scheduleOnce(
-        1.second, self, OperationTimeout(id))
-      val status = OperationStatus(
+      val op = OperationStatus(
+        id = id,
         key = key,
         valueOption = valueOption,
-        senderActor = sender,
+        client = sender,
         remainingReplicators = replicators,
         persisted = false,
-        persistTimeout = persistTimeout,
-        operationTimeout = operationTimeout
+        persistTimeout =
+          context.system.scheduler.schedule(
+            100.milliseconds, 100.milliseconds, self, PersistTimeout(id)),
+        operationTimeout =
+          context.system.scheduler.scheduleOnce(
+            1.second, self, OperationTimeout(id))
       )
-      operations += ((id, status))
+      operations += ((id, op))
       persistence ! Persist(key, valueOption, id)
       replicators.foreach { _ ! Replicate(key, valueOption, id) }
   }
@@ -128,21 +129,20 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     case PersistTimeout(id) =>
       operations.get(id) match {
-        case Some(status) => persistence ! Persist(status.key, status.valueOption, id)
+        case Some(op) => persistence ! Persist(op.key, op.valueOption, id)
         case None =>
       }
 
     case Persisted(_, id) =>
       operations.get(id) match {
-        case Some(status) =>
-          val newStatus = status.copy(persisted = true)
-          if (isOperationDone(newStatus)) {
-            status.done
-            status.senderActor ! OperationAck(id)
+        case Some(op) =>
+          val newOp = op.copy(persisted = true)
+          if (isOperationDone(newOp)) {
             operations -= id
+            finishOperation(newOp, true)
           } else {
-            operations += ((id, newStatus))
-            newStatus.persistTimeout.cancel
+            operations += ((id, newOp))
+            newOp.persistTimeout.cancel
           }
         case None =>
       }
@@ -150,53 +150,61 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     case Replicated(key, id) =>
       operations.get(id) match {
-        case Some(status) =>
-          val newStatus = status.copy(
-            remainingReplicators = status.remainingReplicators - sender)
-          if (isOperationDone(newStatus)) {
-            status.done
-            status.senderActor ! OperationAck(id)
+        case Some(op) =>
+          val newOp = op.copy(
+            remainingReplicators = op.remainingReplicators - sender)
+          if (isOperationDone(newOp)) {
             operations -= id
+            finishOperation(newOp, true)
           } else {
-            operations += ((id, newStatus))
+            operations += ((id, newOp))
           }
         case None =>
       }
 
     case OperationTimeout(id) =>
       operations.get(id) match {
-        case Some(status) =>
+        case Some(op) =>
           operations -= id
-          status.done
-          status.senderActor ! OperationFailed(id)
+          finishOperation(op, false)
         case None =>
       }
 
     case Replicas(replicas) =>
-      val nextSecondaries = replicas - self
-      val currentSecondaries = replicatorBySecondary.keySet
+      val nextReplicas = replicas - self
+      val currentReplicas = secondaries.keySet
 
-      val newSecondaries = nextSecondaries -- currentSecondaries
-      val oldSecondaries = currentSecondaries -- nextSecondaries
-
-      val newSecondRep = newSecondaries.map { s =>
-        (s, context.actorOf(Replicator.props(s)))
+      val newReplicas = nextReplicas -- currentReplicas
+      val droppedReplicas = currentReplicas -- nextReplicas
+      val newSecondaries = newReplicas.map { replica =>
+        (replica, context.actorOf(Replicator.props(replica)))
       }
-      val oldSecondRep = oldSecondaries.map { s =>
-        (s, replicatorBySecondary(s))
+      val droppedSecondaries = secondaries.filterKeys { replica =>
+        droppedReplicas.contains(replica)
       }
+      val newReplicators = newSecondaries.map { _._2 }
+      val droppedReplicators = droppedReplicas.map { secondaries(_) }
 
-      val newReplicators = newSecondRep.toMap.values
-      val oldReplicators = oldSecondRep.toMap.values
+      secondaries = secondaries -- droppedSecondaries.keySet ++ newSecondaries
+      replicators = replicators -- droppedReplicators ++ newReplicators
+
+      operations.map { case (id, op) =>
+        val newOp = op.copy(remainingReplicators = op.remainingReplicators -- droppedReplicators)
+        if (isOperationDone(newOp)) {
+          operations -= id
+          finishOperation(newOp, true)
+        } else {
+          operations += ((id, newOp))
+        }
+      }
 
       for {
-        r <- newReplicators
-        (k, v) <- kv
+        replicator <- newReplicators
+        (key, value) <- kv
       }
-        r ! Replicate(k, Some(v), 0L)
-      oldReplicators.foreach { context.stop(_) }
+        replicator ! Replicate(key, Some(value), 0L)
 
-      replicators = replicators -- oldReplicators ++ newReplicators
+      droppedReplicators.foreach { context.stop(_) }
   }
 
   /* TODO Behavior for the replica role. */
@@ -209,30 +217,30 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
           case Some(value) => kv = kv + ((key, value))
           case None => kv = kv - key
         }
-        val persistTimeout = context.system.scheduler.schedule(
-          100.milliseconds, 100.milliseconds, self, PersistTimeout(seq))
-        val status = SnapshotStatus(
+        val snapshot = SnapshotStatus(
+          seq = seq,
           key = key,
           valueOption = valueOption,
-          senderActor = sender,
-          persistTimeout = persistTimeout
+          replicator = sender,
+          persistTimeout =
+            context.system.scheduler.schedule(
+              100.milliseconds, 100.milliseconds, self, PersistTimeout(seq))
         )
-        snapshots += ((seq, status))
+        snapshots += ((seq, snapshot))
         persistence ! Persist(key, valueOption, seq)
       }
 
     case PersistTimeout(seq) =>
       snapshots.get(seq) match {
-        case Some(status) => persistence ! Persist(status.key, status.valueOption, seq)
+        case Some(s) => persistence ! Persist(s.key, s.valueOption, seq)
         case None =>
       }
 
     case Persisted(key, seq) =>
       snapshots.get(seq) match {
-        case Some(status) =>
-          snapshots = snapshots - seq
-          status.senderActor ! SnapshotAck(key, seq)
-          status.done
+        case Some(s) =>
+          snapshots -= seq
+          finishSnapshot(s)
           expectedSeq = math.max(expectedSeq, seq + 1L)
         case None =>
       }
