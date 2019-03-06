@@ -3,8 +3,9 @@ package protocols
 import akka.actor.typed._
 import akka.actor.typed.Behavior.{ canonicalize, interpretMessage, isUnhandled }
 import scala.collection.immutable.Queue
+import akka.actor.typed.scaladsl.StashOverflowException
 
-class SelectiveReceiveBehavior[T](behavior: Behavior[T], pending: Queue[T])
+class SelectiveReceiveBehavior[T](behavior: Behavior[T], pending: Queue[T], bufferSize: Int)
   extends ExtensibleBehavior[T] {
 
   def retryPending(
@@ -35,11 +36,15 @@ class SelectiveReceiveBehavior[T](behavior: Behavior[T], pending: Queue[T])
   def receive(ctx: ActorContext[T], msg: T): Behavior[T] = {
     val nextBehavior = interpretMessage(behavior, ctx, msg)
     if (isUnhandled(nextBehavior)) {
-      new SelectiveReceiveBehavior(behavior, pending.enqueue(msg))
+      if (pending.length >= bufferSize) {
+        throw new StashOverflowException(s"buffer is full ($bufferSize)")
+      } else {
+        new SelectiveReceiveBehavior(behavior, pending.enqueue(msg), bufferSize)
+      }
     } else {
       val canonicalNext = canonicalize(nextBehavior, behavior, ctx)
       val (newBehavior, newPending) = retryPending(canonicalNext, pending, ctx)
-      new SelectiveReceiveBehavior(newBehavior, newPending)
+      new SelectiveReceiveBehavior(newBehavior, newPending, bufferSize)
     }
   }
   def receiveSignal(ctx: ActorContext[T], msg: Signal): Behavior[T] = ???
@@ -59,5 +64,5 @@ object SelectiveReceive {
       * `validateAsInitial`, `interpretMessage`,`canonicalize` and `isUnhandled`.
       */
     def apply[T](bufferSize: Int, initialBehavior: Behavior[T]): Behavior[T] =
-      new SelectiveReceiveBehavior(initialBehavior, Queue.empty[T])
+      new SelectiveReceiveBehavior(initialBehavior, Queue.empty[T], bufferSize)
 }
