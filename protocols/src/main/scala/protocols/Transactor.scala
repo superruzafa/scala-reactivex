@@ -53,8 +53,10 @@ object Transactor {
     private def idle[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] =
       Behaviors.receivePartial[PrivateCommand[T]] {
         case (ctx, Begin(replyTo)) =>
-          val session = sessionHandler(value, null, Set.empty[Long])
+          val session = sessionHandler(value, ctx.self, Set.empty[Long])
           val sessionRef = ctx.spawnAnonymous(session)
+          ctx.watch(sessionRef)
+          ctx.setReceiveTimeout(sessionTimeout, RolledBack(sessionRef))
           replyTo ! sessionRef
           inSession(value, sessionTimeout, sessionRef)
         case _ => Behaviors.same
@@ -72,8 +74,8 @@ object Transactor {
       */
     private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
       Behaviors.receiveMessage[PrivateCommand[T]] {
-        case Committed(ref, value) => idle(value, sessionTimeout)
-        case RolledBack(ref) => idle(rollbackValue, sessionTimeout)
+        case Committed(ref, value) if ref == sessionRef => idle(value, sessionTimeout)
+        case RolledBack(ref) if ref == sessionRef => idle(rollbackValue, sessionTimeout)
       }
 
     /**
@@ -85,15 +87,19 @@ object Transactor {
       * @param done Set of already applied [[Modify]] messages
       */
     private def sessionHandler[T](currentValue: T, commit: ActorRef[Committed[T]], done: Set[Long]): Behavior[Session[T]] =
-      Behaviors.receiveMessage[Session[T]] {
-        case Extract(f, replyTo) =>
+      Behaviors.receivePartial[Session[T]] {
+        case (_, Extract(f, replyTo)) =>
           replyTo ! f(currentValue)
           Behaviors.same
-        case Modify(f, id, reply, replyTo) =>
+        case (_, Modify(f, id, reply, replyTo)) =>
           replyTo ! reply
           val newValue = f(currentValue)
           sessionHandler(newValue, commit, done + id)
-        case Commit(reply, replyTo) => Behaviors.stopped
-        case Rollback() => Behaviors.stopped
+        case (ctx, Commit(reply, replyTo)) =>
+          commit ! Committed(ctx.self, currentValue)
+          replyTo ! reply
+          Behaviors.stopped
+        case (ctx, Rollback()) =>
+          Behaviors.stopped
       }
 }
