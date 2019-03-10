@@ -94,6 +94,9 @@ object Transactor {
         case (_, Extract(f, replyTo)) =>
           replyTo ! f(currentValue)
           Behaviors.same
+        case (_, Modify(_, id, reply, replyTo)) if done.contains(id) =>
+          replyTo ! reply
+          Behaviors.same
         case (_, Modify(f, id, reply, replyTo)) =>
           replyTo ! reply
           val newValue = f(currentValue)
