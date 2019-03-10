@@ -55,8 +55,9 @@ object Transactor {
         case (ctx, Begin(replyTo)) =>
           val session = sessionHandler(value, ctx.self, Set.empty[Long])
           val sessionRef = ctx.spawnAnonymous(session)
-          ctx.watch(sessionRef)
-          ctx.setReceiveTimeout(sessionTimeout, RolledBack(sessionRef))
+          val rolledBackMsg = RolledBack(sessionRef)
+          ctx.watchWith(sessionRef, rolledBackMsg)
+          ctx.setReceiveTimeout(sessionTimeout, rolledBackMsg)
           replyTo ! sessionRef
           inSession(value, sessionTimeout, sessionRef)
         case _ => Behaviors.same
@@ -73,9 +74,11 @@ object Transactor {
       * @param sessionRef Reference to the child [[Session]] actor
       */
     private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
-      Behaviors.receiveMessage[PrivateCommand[T]] {
-        case Committed(ref, value) if ref == sessionRef => idle(value, sessionTimeout)
-        case RolledBack(ref) if ref == sessionRef => idle(rollbackValue, sessionTimeout)
+      Behaviors.receive[PrivateCommand[T]] {
+        case (ctx, Committed(ref, value)) if ref == sessionRef => idle(value, sessionTimeout)
+        case (ctx, RolledBack(ref)) if ref == sessionRef =>
+          ctx.stop(ref)
+          idle(rollbackValue, sessionTimeout)
       }
 
     /**
