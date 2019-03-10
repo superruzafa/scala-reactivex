@@ -74,7 +74,7 @@ object Transactor {
       * @param sessionRef Reference to the child [[Session]] actor
       */
     private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
-      Behaviors.receive[PrivateCommand[T]] {
+      Behaviors.receivePartial[PrivateCommand[T]] {
         case (ctx, Committed(ref, value)) if ref == sessionRef => idle(value, sessionTimeout)
         case (ctx, RolledBack(ref)) if ref == sessionRef =>
           ctx.stop(ref)
