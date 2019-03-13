@@ -2,4 +2,4 @@
 
 My solutions to the Programming Reactive Systems course.
 
-https://courses.edx.org/courses/course-v1:EPFLx+scala-reactiveX+1T2019/
+https://www.edx.org/course/programming-reactive-systems
