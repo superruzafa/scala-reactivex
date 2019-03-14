@@ -120,7 +120,19 @@ object Server {
     *  - you may find the `statefulMapConcat` operation useful.
     */
   val followersFlow: Flow[Event, (Event, Followers), NotUsed] =
-    unimplementedFlow
+    Flow[Event].statefulMapConcat { () => {
+      var followers = Map.empty[Int, Set[Int]].withDefaultValue(Set.empty[Int])
+      event => {
+        event match {
+          case Event.Follow(_, from, to) =>
+            followers += from -> (followers(from) + to)
+          case Event.Unfollow(_, from, to) =>
+            followers += from -> (followers(from) - to)
+          case _ =>
+        }
+        Iterable((event, followers))
+      }
+    }}
 
   /**
     * @return Whether the given user should be notified by the incoming `Event`,
