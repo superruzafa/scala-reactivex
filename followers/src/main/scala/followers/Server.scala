@@ -7,8 +7,9 @@ import akka.stream.{ActorAttributes, Materializer}
 import akka.util.ByteString
 import followers.model.{Event, Followers, Identity}
 
-import scala.collection.SortedSet
+import scala.collection.immutable.{Iterable, Queue, SortedSet}
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.annotation.tailrec
 
 /**
   * Utility object that describe stream manipulations used by the server
@@ -31,7 +32,9 @@ object Server {
     * Hint: you may find the [[Framing]] flows useful.
     */
   val reframedFlow: Flow[ByteString, String, NotUsed] =
-    unimplementedFlow
+    Framing
+      .delimiter(ByteString("\n"), Int.MaxValue, false)
+      .map { _.utf8String }
 
   /**
     * A flow that consumes chunks of bytes and produces [[Event]] messages.
@@ -44,7 +47,7 @@ object Server {
     * Hint: reuse `reframedFlow`
     */
   val eventParserFlow: Flow[ByteString, Event, NotUsed] =
-    unimplementedFlow
+    reframedFlow.map { Event.parse(_) }
 
   /**
     * Implement a Sink that will look for the first [[Identity]]
@@ -71,8 +74,42 @@ object Server {
     * You may want to use `statefulMapConcat` in order to keep the state needed for this
     * operation around in the operator.
     */
-  val reintroduceOrdering: Flow[Event, Event, NotUsed] =
-    unimplementedFlow
+  val reintroduceOrdering: Flow[Event, Event, NotUsed] = {
+
+    /**
+      * Given a buffer of events, this function will return the longest prefix
+      * of sequential events (by sequenceNr) starting at seqNr, the remaining
+      * buffer after unbuffer that prefix and the new expected sequenceNr
+      */
+    def unbufferPrefix(buffer: SortedSet[Event], seqNr: Int):
+      (Iterable[Event], SortedSet[Event], Int) =
+    {
+      @tailrec
+      def _unbufferPrefix(prefix: Queue[Event], buffer: SortedSet[Event], seqNr: Int):
+        (Iterable[Event], SortedSet[Event], Int) =
+      {
+        lazy val basecase = (prefix.to[Iterable], buffer, seqNr)
+        buffer.headOption match {
+          case None => basecase
+          case Some(event) if event.sequenceNr != seqNr => basecase
+          case Some(event) => _unbufferPrefix(prefix.enqueue(event), buffer.tail, seqNr + 1)
+        }
+      }
+      _unbufferPrefix(Queue.empty[Event], buffer, seqNr)
+    }
+
+    Flow[Event].statefulMapConcat { () => {
+      var buffer: SortedSet[Event] = SortedSet.empty[Event]
+      var seqNr = 1
+      event => {
+        buffer += event
+        val (prefix, newBuffer, newSeqNr) = unbufferPrefix(buffer, seqNr)
+        buffer = newBuffer
+        seqNr = newSeqNr
+        prefix
+      }
+    }}
+  }
 
   /**
     * A flow that associates a state of [[Followers]] to

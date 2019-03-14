@@ -32,6 +32,11 @@ sealed trait Event {
 
 object Event {
 
+  implicit val sequenceOrdering = new Ordering[Event] {
+    def compare(ev1: Event, ev2: Event): Int =
+      ev1.sequenceNr.compare(ev2.sequenceNr)
+  }
+
   def parse(message: String): Event = {
     val fields = message.split("\\|")
     val seqNr = fields.head.toInt
