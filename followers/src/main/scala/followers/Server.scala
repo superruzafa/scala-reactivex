@@ -60,7 +60,9 @@ object Server {
     * (and have a look at `Keep.right`).
     */
   val identityParserSink: Sink[ByteString, Future[Identity]] =
-    unimplementedSink
+    reframedFlow
+      .map(Identity.parse(_))
+      .toMat(Sink.head)(Keep.right)
 
   /**
     * A flow that consumes unordered messages and produces messages ordered by `sequenceNr`.
@@ -141,8 +143,16 @@ object Server {
     * @param userId Id of the user
     * @param eventAndFollowers Event and current state of followers
     */
-  def isNotified(userId: Int)(eventAndFollowers: (Event, Followers)): Boolean =
-    ???
+  def isNotified(userId: Int)(eventAndFollowers: (Event, Followers)): Boolean = {
+    val (event, followers) = eventAndFollowers
+    event match {
+      case Event.Follow(_, _, to) => to == userId
+      case Event.Unfollow(_, _, _) => false
+      case Event.Broadcast(_) => true
+      case Event.PrivateMsg(_, _, to) => to == userId
+      case Event.StatusUpdate(_, _) => followers.contains(userId)
+    }
+  }
 
   // Utilities to temporarily have unimplemented parts of the program
   private def unimplementedFlow[A, B, C]: Flow[A, B, C] =
